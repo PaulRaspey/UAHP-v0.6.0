@@ -13,8 +13,9 @@ UAHP v0.6.0 adds hybrid cryptography following NIST FIPS 203/204:
 - Hybrid mode (classical + PQC) during the 2026-2035 transition window
 - Pure PQC target post-2035
 
-This keeps UAHP backward-compatible with v0.5.4 agents while gaining
-quantum resistance for agents that support it.
+This keeps UAHP backward-compatible with v0.5.4 agents. Honest status:
+hybrid PQC-ready design — Ed25519/X25519 today, ML-KEM-768/ML-DSA-65
+behind a tested feature flag (requires liboqs + liboqs-python).
 """
 
 from enum import Enum
@@ -69,7 +70,7 @@ class KEMAlgorithm(str, Enum):
 class QuantumReadinessTier(str, Enum):
     """Agent quantum readiness classification."""
     VULNERABLE = "vulnerable"        # Ed25519/X25519 only — will not survive CRQC
-    TRANSITIONING = "transitioning"  # Hybrid mode — quantum-safe today
+    TRANSITIONING = "transitioning"  # Hybrid mode actually running (requires oqs)
     QUANTUM_SAFE = "quantum_safe"    # Pure PQC — future-proof
 
 

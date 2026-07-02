@@ -7,7 +7,7 @@ demonstrates that the ML-DSA overhead argument is solved.
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from uahp.signing_policy import (
+from signing_policy import (
     TieredSigner, SessionCache, SigningPolicy,
     policy_for_message, MESSAGE_POLICY_MAP
 )

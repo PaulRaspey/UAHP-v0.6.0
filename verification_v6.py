@@ -11,12 +11,14 @@ import base64
 import hashlib
 from typing import Optional
 
-from .schemas_v6 import KeyAlgorithm
+from schemas_v6 import KeyAlgorithm
 
 try:
     import oqs
+    _ = oqs.Signature  # probe that the wrapper actually loaded
     OQS_AVAILABLE = True
-except ImportError:
+except BaseException:  # the wrapper raises SystemExit when liboqs is missing
+    oqs = None
     OQS_AVAILABLE = False
 
 try:
@@ -163,9 +165,9 @@ def quantum_readiness_summary() -> dict:
         ),
         "quantum_threat": "ECDLP-256 breakable with ~1,200 logical qubits (Google, March 2026)",
         "recommended_action": (
-            "System is quantum-ready (hybrid mode active)"
+            "Hybrid PQC feature flag available (oqs installed)"
             if OQS_AVAILABLE
-            else "Install oqs-python to enable quantum-resistant cryptography"
+            else "Classical-only (Ed25519/X25519). Install liboqs + liboqs-python to enable the hybrid PQC feature flag"
         ),
         "nist_standards": ["FIPS 203 (ML-KEM)", "FIPS 204 (ML-DSA)", "FIPS 205 (SLH-DSA)"],
         "google_timeline": "2029 migration deadline (Google Quantum AI, March 2026)"
