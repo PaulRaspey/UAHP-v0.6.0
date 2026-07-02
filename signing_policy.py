@@ -29,11 +29,29 @@ Session caching:
 """
 
 from __future__ import annotations
+import base64
 import hashlib
 import hmac
 import time
 from enum import Enum
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+from session_v6 import PQCUnavailableError, PQC_INSTALL_INSTRUCTIONS
+
+# oqs wrapper raises SystemExit (not ImportError) when liboqs is missing,
+# so the guard must catch BaseException.
+try:
+    import oqs
+    _ = oqs.Signature
+    OQS_AVAILABLE = True
+except BaseException:
+    oqs = None
+    OQS_AVAILABLE = False
 
 
 class SigningPolicy(str, Enum):
@@ -438,16 +456,18 @@ class DelegatedVerifier:
         if attestation.get("message_hash") != expected_hash:
             return False, "message hash mismatch — attestation does not bind to original message"
 
-        # Rule 5: Ed25519 signature on attestation
-        # (stub — replace with real Ed25519 verify in production)
+        # Rule 5: real Ed25519 signature on the attestation, verified
+        # with the attester's PUBLIC key (hex-encoded raw bytes)
         attest_payload = (
             request_id +
             attester_id +
             attestation.get("message_hash", "") +
             str(attested_at)
         ).encode()
-        expected_sig = hashlib.sha256(attester_public_key.encode() + attest_payload).hexdigest()
-        if attestation.get("attester_signature") != expected_sig:
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(attester_public_key))
+            pub.verify(bytes.fromhex(attestation.get("attester_signature", "")), attest_payload)
+        except Exception:
             return False, "attestation signature invalid"
 
         # All checks passed
@@ -461,11 +481,13 @@ class DelegatedVerifier:
         request: Dict,
         verification_result: bool,
         attester_id: str,
-        attester_private_key: str
+        attester_private_key: Union[bytes, Ed25519PrivateKey]
     ) -> Dict:
         """
         Build an attestation response (called by the heavier verifier node).
-        The heavy node runs ML-DSA-87 verification and signs the result.
+        The heavy node runs ML-DSA-87 verification and signs the result
+        with its real Ed25519 key (an Ed25519PrivateKey object or 32
+        raw seed bytes).
         """
         attested_at = time.time()
         attest_payload = (
@@ -475,8 +497,9 @@ class DelegatedVerifier:
             str(attested_at)
         ).encode()
 
-        # Stub — replace with real Ed25519 in production
-        sig = hashlib.sha256(attester_private_key.encode() + attest_payload).hexdigest()
+        if not isinstance(attester_private_key, Ed25519PrivateKey):
+            attester_private_key = Ed25519PrivateKey.from_private_bytes(attester_private_key)
+        sig = attester_private_key.sign(attest_payload).hex()
 
         return {
             "request_id": request["request_id"],
@@ -510,14 +533,44 @@ class TieredSigner:
     def __init__(
         self,
         agent_id: str,
-        private_key: bytes,
+        private_key: Union[bytes, Ed25519PrivateKey, None] = None,
         session_cache: Optional[SessionCache] = None,
         force_policy: Optional[SigningPolicy] = None,
+        allow_degraded: bool = False,
     ):
+        """
+        private_key: a real Ed25519 key — either an Ed25519PrivateKey
+        object or 32 raw seed bytes. If None, a fresh key is generated.
+
+        allow_degraded: if True and oqs is not installed, PQC tiers
+        (STANDARD hybrid part, MAXIMUM) degrade to Ed25519-only with
+        method labeled "ed25519_degraded" and quantum_safe=False.
+        If False (default), requesting a PQC tier without oqs raises
+        PQCUnavailableError. No silent fallback either way.
+        """
         self.agent_id = agent_id
-        self.private_key = private_key
+        if private_key is None:
+            self._ed_key = Ed25519PrivateKey.generate()
+        elif isinstance(private_key, Ed25519PrivateKey):
+            self._ed_key = private_key
+        else:
+            self._ed_key = Ed25519PrivateKey.from_private_bytes(private_key)
+        self.public_key = self._ed_key.public_key().public_bytes_raw().hex()
         self.session_cache = session_cache
         self.force_policy = force_policy
+        self.allow_degraded = allow_degraded
+
+        # Real ML-DSA signers, created only when liboqs is present.
+        self._ml_dsa_65 = oqs.Signature("ML-DSA-65") if OQS_AVAILABLE else None
+        self._ml_dsa_87 = oqs.Signature("ML-DSA-87") if OQS_AVAILABLE else None
+        if OQS_AVAILABLE:
+            self.ml_dsa_65_public_key = base64.b64encode(
+                self._ml_dsa_65.generate_keypair()).decode()
+            self.ml_dsa_87_public_key = base64.b64encode(
+                self._ml_dsa_87.generate_keypair()).decode()
+        else:
+            self.ml_dsa_65_public_key = None
+            self.ml_dsa_87_public_key = None
 
         self._sign_count = {p: 0 for p in SigningPolicy}
         self._total_signing_ms = {p: 0.0 for p in SigningPolicy}
@@ -526,6 +579,7 @@ class TieredSigner:
         """
         Sign a message using the appropriate policy tier.
         Returns a dict with signature, policy, and timing metadata.
+        The method and quantum_safe fields describe what actually ran.
         """
         policy = self.force_policy or policy_for_message(message_type)
         start = time.perf_counter()
@@ -541,59 +595,62 @@ class TieredSigner:
                     "policy": policy.value,
                     "method": "hmac_sha256_in_session",
                     "latency_ms": round(elapsed, 4),
-                    "quantum_safe": self.session_cache.shared_secret is not None,
+                    # The HMAC key is derived from the session handshake.
+                    # Unless that handshake ran a hybrid KEM, the secret
+                    # is classical. This module cannot prove it did, so
+                    # it does not claim quantum safety.
+                    "quantum_safe": False,
                 }
 
         # Full asymmetric signing based on policy
-        sig = self._sign_by_policy(message, policy)
+        sig, method, quantum_safe = self._sign_by_policy(message, policy)
         elapsed = (time.perf_counter() - start) * 1000
         self._record(policy, elapsed)
 
         return {
             "signature": sig,
             "policy": policy.value,
-            "method": self._method_name(policy),
+            "method": method,
             "latency_ms": round(elapsed, 4),
-            "quantum_safe": policy != SigningPolicy.LIGHTWEIGHT,
+            "quantum_safe": quantum_safe,
         }
 
-    def _sign_by_policy(self, message: bytes, policy: SigningPolicy) -> str:
-        """Apply the correct signing algorithm for the policy tier."""
-        digest = hashlib.sha256(message).hexdigest()
-
+    def _sign_by_policy(
+        self, message: bytes, policy: SigningPolicy
+    ) -> Tuple[str, str, bool]:
+        """
+        Apply the correct signing algorithm for the policy tier.
+        Returns (signature, method_actually_used, quantum_safe).
+        Every signature here is real: Ed25519 via the cryptography
+        library, ML-DSA via liboqs. There are no hash stubs.
+        """
         if policy == SigningPolicy.LIGHTWEIGHT:
             # Ed25519 only — fast, classical
-            return hashlib.sha256(
-                (self.agent_id + digest + "ed25519").encode()
-            ).hexdigest()
+            return self._ed_key.sign(message).hex(), "ed25519", False
 
-        elif policy == SigningPolicy.STANDARD:
-            # Hybrid: Ed25519 + ML-DSA-65
-            # Both must verify. Break one = still secure.
-            classical_sig = hashlib.sha256(
-                (self.agent_id + digest + "ed25519").encode()
-            ).hexdigest()
-            pqc_sig = hashlib.sha512(
-                (self.agent_id + digest + "ml-dsa-65").encode()
-            ).hexdigest()
-            # In production: concatenate real signatures
-            # Here: return combined stub
-            return f"hybrid:{classical_sig[:32]}:{pqc_sig[:32]}"
+        if not OQS_AVAILABLE:
+            if not self.allow_degraded:
+                raise PQCUnavailableError(PQC_INSTALL_INSTRUCTIONS)
+            # Explicit, labeled degrade — never silent
+            return (
+                self._ed_key.sign(message).hex(),
+                "ed25519_degraded (ML-DSA unavailable: liboqs not installed)",
+                False,
+            )
 
-        elif policy == SigningPolicy.MAXIMUM:
-            # ML-DSA-87 only — pure PQC, maximum strength
-            return hashlib.sha512(
-                (self.agent_id + digest + "ml-dsa-87-maximum").encode()
-            ).hexdigest()
+        if policy == SigningPolicy.STANDARD:
+            # Hybrid: Ed25519 + ML-DSA-65. Both signatures are real.
+            classical_sig = self._ed_key.sign(message).hex()
+            pqc_sig = base64.b64encode(self._ml_dsa_65.sign(message)).decode()
+            return (
+                f"hybrid:{classical_sig}:{pqc_sig}",
+                "hybrid_ed25519_ml_dsa_65",
+                True,
+            )
 
-        return hashlib.sha256(message).hexdigest()
-
-    def _method_name(self, policy: SigningPolicy) -> str:
-        return {
-            SigningPolicy.LIGHTWEIGHT: "ed25519",
-            SigningPolicy.STANDARD: "hybrid_ed25519_ml_dsa_65",
-            SigningPolicy.MAXIMUM: "ml_dsa_87",
-        }.get(policy, "unknown")
+        # MAXIMUM: ML-DSA-87 only — pure PQC, strongest available
+        pqc_sig = base64.b64encode(self._ml_dsa_87.sign(message)).decode()
+        return pqc_sig, "ml_dsa_87", True
 
     def _record(self, policy: SigningPolicy, elapsed_ms: float):
         self._sign_count[policy] += 1

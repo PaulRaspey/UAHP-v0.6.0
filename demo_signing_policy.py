@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from signing_policy import (
     TieredSigner, SessionCache, SigningPolicy,
-    policy_for_message, MESSAGE_POLICY_MAP
+    policy_for_message, MESSAGE_POLICY_MAP, OQS_AVAILABLE
 )
 
 
@@ -20,13 +20,22 @@ def run_demo():
     print("=" * 65)
     print()
 
-    # Create a signer with a mock shared secret
+    if not OQS_AVAILABLE:
+        print("  NOTE: liboqs is not installed. PQC tiers (STANDARD hybrid,")
+        print("  MAXIMUM) will run in EXPLICIT degraded mode: real Ed25519")
+        print("  signatures, method labeled ed25519_degraded, quantum_safe")
+        print("  False. Install liboqs + liboqs-python for real ML-DSA.")
+        print()
+
+    # Create a signer with a mock shared secret. The Ed25519 key is real;
+    # allow_degraded=True lets the demo run without liboqs, loudly.
     shared_secret = b"uahp_session_shared_secret_32byt"
     cache = SessionCache(session_id="session_abc123", shared_secret=shared_secret)
     signer = TieredSigner(
         agent_id="alice-quantum",
         private_key=b"alice_private_key_32bytes_pad___",
-        session_cache=cache
+        session_cache=cache,
+        allow_degraded=True,
     )
 
     print("POLICY MAP (message type → signing tier):")

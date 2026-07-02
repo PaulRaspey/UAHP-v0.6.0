@@ -143,10 +143,10 @@ def demo_delegated_verification():
     print()
 
     # Heavy registry node runs the actual ML-DSA-87 verification
-    # and builds a signed attestation
-    # Stub uses same key material for sign/verify (production uses real Ed25519 keypair)
-    attester_private_key = "registry_node_alpha_key"
-    attester_public_key = "registry_node_alpha_key"
+    # and builds an attestation signed with its REAL Ed25519 key
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    attester_private_key = Ed25519PrivateKey.generate()
+    attester_public_key = attester_private_key.public_key().public_bytes_raw().hex()
 
     attestation = drone.build_attestation(
         request=request,
@@ -175,13 +175,16 @@ def demo_delegated_verification():
         local_agent_id="drone_sensor_008"
     )
     request2 = drone2.build_verification_request(message, signature, signer_pubkey)
+    rogue_key = Ed25519PrivateKey.generate()
     fake_attestation = drone2.build_attestation(
         request=request2,
         verification_result=True,
         attester_id="unknown_rogue_node",  # Not trusted
-        attester_private_key="rogue_key"
+        attester_private_key=rogue_key
     )
-    valid2, reason2 = drone2.receive_attestation(fake_attestation, "rogue_public_key")
+    valid2, reason2 = drone2.receive_attestation(
+        fake_attestation, rogue_key.public_key().public_bytes_raw().hex()
+    )
     print(f"  Rogue attester test: {'✓ accepted' if valid2 else f'✗ rejected ({reason2})'}")
     print()
 
