@@ -1,3 +1,5 @@
+Consolidated into github.com/PaulRaspey/uahp. Archived for history; tags remain browsable.
+
 # UAHP v0.6.0 — Hybrid PQC-Ready Edition
 
 **Responding to Google's March 31, 2026 whitepaper.**
